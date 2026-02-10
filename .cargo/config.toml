@@ -1,0 +1,4 @@
+[env]
+CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+VCPKG_ROOT = "C:/vcpkg"
+VCPKG_DEFAULT_TRIPLET = "x64-windows-static-md"
