@@ -22,11 +22,12 @@ pub struct Vehicle {
     pub velocity: f32,
     pub elapsed: f32,
     pub heading: (f32, f32),
+    pub lane: u8,
     pub turned: bool,
 }
 
 impl Vehicle {
-    pub fn new(approach: Approach, route: Route, position: (f32, f32), velocity: f32) -> Self {
+    pub fn new(approach: Approach, route: Route, lane: u8, position: (f32, f32), velocity: f32) -> Self {
         Self {
             approach,
             route,
@@ -34,6 +35,7 @@ impl Vehicle {
             velocity,
             elapsed: 0.0,
             heading: heading_for_approach(approach),
+            lane,
             turned: false,
         }
     }

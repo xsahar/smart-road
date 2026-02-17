@@ -46,7 +46,8 @@ pub fn draw_vehicles(
         };
         canvas.set_draw_color(color);
 
-        for vehicle in &lane.vehicles {
+        for sublane in &lane.incoming {
+            for vehicle in sublane {
             let horizontal = vehicle.heading.0.abs() > vehicle.heading.1.abs();
             let (w, h) = if horizontal {
                 (car_height, car_width)
@@ -57,6 +58,7 @@ pub fn draw_vehicles(
             let y = center_y + vehicle.position.1 as i32 - h / 2;
             let rect = Rect::new(x, y, w as u32, h as u32);
             canvas.fill_rect(rect)?;
+            }
         }
     }
 
