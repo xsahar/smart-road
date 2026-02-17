@@ -29,10 +29,18 @@ pub fn run() -> Result<(), String> {
     let mut random_spawn = false;
     let mut last_spawn_time = Instant::now() - Duration::from_millis(1000);
     let spawn_cooldown = Duration::from_millis(400);
+    let mut last_frame = Instant::now();
 
     let mut sim = Simulation::new();
 
     'running: loop {
+        let now = Instant::now();
+        let mut dt = now.duration_since(last_frame).as_secs_f32();
+        last_frame = now;
+        if dt > 0.05 {
+            dt = 0.05;
+        }
+
         let can_spawn = last_spawn_time.elapsed() >= spawn_cooldown;
         let frame_input = input::collect(&mut event_pump, can_spawn);
 
@@ -44,24 +52,33 @@ pub fn run() -> Result<(), String> {
             random_spawn = !random_spawn;
         }
 
-        let mut spawn_request = frame_input.spawn_requested;
-        if random_spawn && can_spawn {
-            spawn_request = true;
-        }
-
-        if spawn_request {
+        if let Some(approach) = frame_input.spawn_approach {
             last_spawn_time = Instant::now();
-            sim.request_spawn();
+            sim.request_spawn(approach);
+        } else if random_spawn && can_spawn {
+            last_spawn_time = Instant::now();
+            sim.request_spawn_random();
         }
 
-        sim.update();
+        sim.update(dt);
 
         canvas.set_draw_color(Color::RGB(20, 20, 20));
         canvas.clear();
         render::draw_intersection(&mut canvas, WINDOW_WIDTH, WINDOW_HEIGHT)?;
+        render::draw_vehicles(&mut canvas, &sim.lanes, WINDOW_WIDTH, WINDOW_HEIGHT)?;
         canvas.present();
         std::thread::sleep(Duration::from_millis(16));
     }
+
+    let summary = sim.stats().summary_line();
+    println!("{}", summary);
+    canvas
+        .window_mut()
+        .set_title(&summary)
+        .map_err(|e| e.to_string())?;
+    render::draw_exit_screen(&mut canvas, WINDOW_WIDTH, WINDOW_HEIGHT, sim.stats())?;
+    canvas.present();
+    std::thread::sleep(Duration::from_millis(1500));
 
     Ok(())
 }
