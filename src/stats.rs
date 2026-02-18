@@ -18,7 +18,7 @@ impl Stats {
         }
     }
 
-    pub fn record_spawn(&mut self, velocity: f32) {
+    pub fn record_velocity(&mut self, velocity: f32) {
         if velocity > self.max_velocity {
             self.max_velocity = velocity;
         }
@@ -42,11 +42,7 @@ impl Stats {
     }
 
     pub fn summary_line(&self) -> String {
-        let min_velocity = if self.min_velocity.is_finite() {
-            self.min_velocity
-        } else {
-            0.0
-        };
+        let min_velocity = if self.min_velocity.is_finite() { self.min_velocity } else { 0.0 };
         let min_time = if self.min_time.is_finite() { self.min_time } else { 0.0 };
         format!(
             "smart-road | passed: {} | v(min/max): {:.1}/{:.1} | t(min/max): {:.1}/{:.1} | close: {}",
