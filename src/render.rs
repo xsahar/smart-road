@@ -13,7 +13,6 @@ use crate::stats::Stats;
 
 const ROAD_HALF: i32 = (3.0 * LANE_W) as i32; // = 90px  (total road = 180px)
 
-// ── Colours ──────────────────────────────────────────────────────────────────
 const C_GRASS:     Color = Color::RGB(34,  90,  34);
 const C_ASPHALT:   Color = Color::RGB(50,  50,  53);
 const C_CURB:      Color = Color::RGB(22,  22,  24);
