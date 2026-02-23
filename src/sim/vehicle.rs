@@ -73,10 +73,12 @@ impl Vehicle {
             self.turn_t += (dt / TURN_DURATION).clamp(0.0, 1.0);
             let t = smoothstep(self.turn_t.clamp(0.0, 1.0));
             self.heading = normalize(lerp2(self.turn_from, self.turn_to, t));
+            blend_to_outgoing_lane(&mut self.position, self.turn_to, self.route, t);
             if self.turn_t >= 1.0 {
                 self.turning = false;
                 self.turned = true;
                 self.heading = self.turn_to;
+                snap_to_outgoing_lane(&mut self.position, self.heading, self.route);
             }
         }
 
@@ -136,6 +138,51 @@ fn normalize(v: (f32, f32)) -> (f32, f32) {
 
 fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
+}
+
+fn route_outgoing_offset(route: Route) -> f32 {
+    match route {
+        Route::Right => 2.5 * LANE_W,
+        Route::Straight => 1.5 * LANE_W,
+        Route::Left => 0.5 * LANE_W,
+    }
+}
+
+fn outgoing_lane_target(heading: (f32, f32), route: Route) -> (bool, f32) {
+    let lane_offset = route_outgoing_offset(route);
+    if heading.0.abs() > heading.1.abs() {
+        let y = if heading.0 > 0.0 {
+            lane_offset
+        } else {
+            -lane_offset
+        };
+        (true, y)
+    } else {
+        let x = if heading.1 > 0.0 {
+            -lane_offset
+        } else {
+            lane_offset
+        };
+        (false, x)
+    }
+}
+
+fn blend_to_outgoing_lane(position: &mut (f32, f32), heading: (f32, f32), route: Route, t: f32) {
+    let (is_horizontal, target) = outgoing_lane_target(heading, route);
+    if is_horizontal {
+        position.1 += (target - position.1) * t;
+    } else {
+        position.0 += (target - position.0) * t;
+    }
+}
+
+fn snap_to_outgoing_lane(position: &mut (f32, f32), heading: (f32, f32), route: Route) {
+    let (is_horizontal, target) = outgoing_lane_target(heading, route);
+    if is_horizontal {
+        position.1 = target;
+    } else {
+        position.0 = target;
+    }
 }
 
 pub fn heading_for_approach(approach: Approach) -> (f32, f32) {
