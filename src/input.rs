@@ -35,7 +35,7 @@ pub fn collect(event_pump: &mut EventPump, can_spawn: bool) -> FrameInput {
                 ..
             } => {
                 if can_spawn {
-                    spawn_approach = Some(Approach::North);
+                    spawn_approach = Some(Approach::South);
                 }
             }
             Event::KeyDown {
@@ -44,7 +44,7 @@ pub fn collect(event_pump: &mut EventPump, can_spawn: bool) -> FrameInput {
                 ..
             } => {
                 if can_spawn {
-                    spawn_approach = Some(Approach::South);
+                    spawn_approach = Some(Approach::North);
                 }
             }
             Event::KeyDown {
@@ -53,7 +53,7 @@ pub fn collect(event_pump: &mut EventPump, can_spawn: bool) -> FrameInput {
                 ..
             } => {
                 if can_spawn {
-                    spawn_approach = Some(Approach::West);
+                    spawn_approach = Some(Approach::East);
                 }
             }
             Event::KeyDown {
@@ -62,7 +62,7 @@ pub fn collect(event_pump: &mut EventPump, can_spawn: bool) -> FrameInput {
                 ..
             } => {
                 if can_spawn {
-                    spawn_approach = Some(Approach::East);
+                    spawn_approach = Some(Approach::West);
                 }
             }
             _ => {}

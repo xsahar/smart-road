@@ -14,11 +14,17 @@ pub struct Simulation {
     pub stats:     Stats,
     pending_spawns: Vec<Approach>,
     rng_state:     u32,
+    approach_bag:  Vec<Approach>,
+    bag_index:     usize,
 }
 
 impl Simulation {
     pub fn new() -> Self {
-        Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_nanos() as u64) ^ (d.as_secs() as u64))
+            .unwrap_or(0x1234ABCD);
+        let mut sim = Self {
             lanes: vec![
                 Lane::new(Approach::North),
                 Lane::new(Approach::South),
@@ -27,8 +33,12 @@ impl Simulation {
             ],
             stats: Stats::new(),
             pending_spawns: Vec::new(),
-            rng_state: 0x1234ABCD,
-        }
+            rng_state: seed as u32,
+            approach_bag: Vec::new(),
+            bag_index: 0,
+        };
+        sim.refill_approach_bag();
+        sim
     }
 
     pub fn request_spawn(&mut self, approach: Approach) {
@@ -48,14 +58,16 @@ impl Simulation {
         }
 
         const DESPAWN_LIMIT:       f32 = 540.0;
-        const SAFE_GAP:            f32 = 36.0;
+        const SAFE_GAP:            f32 = 1.4 * LANE_W;
         const INTERSECTION_HALF:   f32 = 4.0 * LANE_W; // covers staggered turn triggers
         const MIN_GAP:             f32 = SAFE_GAP;
         const MAX_BRAKE:           f32 = 300.0;
         const CRUISE_SPEED:        f32 = 120.0;
         const MAX_ACCEL:           f32 = 200.0;
-        const MIN_CRAWL:           f32 = 6.0;
-        const COLLIDE_DIST:        f32 = 26.0;
+        const MIN_CRAWL:           f32 = 0.0;
+        const COLLIDE_DIST:        f32 = 0.9 * LANE_W;
+        const STOP_LINE_DIST:      f32 = 0.65 * LANE_W;
+        const STOP_HOLD_TIME:      f32 = 0.35;
 
         let intersection_occupied = self
             .lanes
@@ -113,7 +125,7 @@ impl Simulation {
                 .map(|(i, _)| i)
                 .collect();
 
-            if enter_idxs.len() > 1 {
+            if !enter_idxs.is_empty() {
                 let priority = |a: Approach| match a {
                     Approach::North => 3,
                     Approach::East  => 2,
@@ -258,11 +270,23 @@ impl Simulation {
                                 self.stats.record_close_call();
                             } else if intersection_reserved {
                                 if !p.allow_enter {
-                                    vehicle.velocity = vehicle.velocity.min(MIN_CRAWL);
+                                    vehicle.velocity = MIN_CRAWL;
                                     self.stats.record_close_call();
                                 }
                             } else {
                                 intersection_reserved = true;
+                            }
+                        }
+
+                        if !vehicle.stopped_once && !is_in_intersection(vehicle.position, INTERSECTION_HALF) {
+                            let stop_dist = distance_to_intersection_edge(vehicle.position, INTERSECTION_HALF);
+                            if stop_dist <= STOP_LINE_DIST {
+                                if vehicle.stop_hold < STOP_HOLD_TIME {
+                                    vehicle.stop_hold += dt;
+                                    vehicle.velocity = 0.0;
+                                } else {
+                                    vehicle.stopped_once = true;
+                                }
                             }
                         }
 
@@ -300,16 +324,17 @@ impl Simulation {
        
         let heading = vehicle::heading_for_approach(approach);
  
-        let left = (-heading.1, heading.0);
+        // Calculate perpendicular offset to the driver's right
+        let right = (-heading.1, heading.0);
         let lateral_offset = LANE_OFFSETS[sublane];
-        let lateral = (left.0 * lateral_offset, left.1 * lateral_offset);
+        let lateral = (right.0 * lateral_offset, right.1 * lateral_offset);
 
         const SPAWN_DIST: f32 = 450.0;
         let base = (-heading.0 * SPAWN_DIST + lateral.0, -heading.1 * SPAWN_DIST + lateral.1);
 
         // Enforce spawn spacing
-        const SPAWN_GAP: f32 = 100.0;
-        let dummy = Vehicle::new(approach, route, sublane as u8, base, 0.0);
+        const SPAWN_GAP: f32 = 2.0 * LANE_W;
+        let dummy = Vehicle::new(approach, route, base, 0.0);
         let spawn_prog = forward_progress(&dummy);
         if let Some(lane) = self.lanes.iter().find(|l| l.approach == approach) {
             let too_close = lane.incoming[sublane]
@@ -318,7 +343,7 @@ impl Simulation {
             if too_close { return; }
         }
 
-        let vehicle = Vehicle::new(approach, route, sublane as u8, base, 120.0);
+        let vehicle = Vehicle::new(approach, route, base, 120.0);
         if let Some(lane) = self.lanes.iter_mut().find(|l| l.approach == approach) {
             lane.incoming[sublane].push(vehicle);
         }
@@ -327,12 +352,12 @@ impl Simulation {
     pub fn stats(&self) -> &Stats { &self.stats }
 
     fn next_random_approach(&mut self) -> Approach {
-        match (self.next_random_u32() % 4) as u8 {
-            0 => Approach::North,
-            1 => Approach::South,
-            2 => Approach::East,
-            _ => Approach::West,
+        if self.bag_index >= self.approach_bag.len() {
+            self.refill_approach_bag();
         }
+        let approach = self.approach_bag[self.bag_index];
+        self.bag_index += 1;
+        approach
     }
 
     fn next_random_route(&mut self) -> Route {
@@ -347,6 +372,22 @@ impl Simulation {
         self.rng_state = self.rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
         self.rng_state
     }
+
+    fn refill_approach_bag(&mut self) {
+        self.approach_bag = vec![
+            Approach::North,
+            Approach::South,
+            Approach::East,
+            Approach::West,
+        ];
+        let mut i = self.approach_bag.len();
+        while i > 1 {
+            i -= 1;
+            let j = (self.next_random_u32() as usize) % (i + 1);
+            self.approach_bag.swap(i, j);
+        }
+        self.bag_index = 0;
+    }
 }
 
 fn forward_progress(vehicle: &Vehicle) -> f32 {
@@ -360,4 +401,8 @@ fn forward_progress(vehicle: &Vehicle) -> f32 {
 
 fn is_in_intersection(position: (f32, f32), half_size: f32) -> bool {
     position.0.abs() <= half_size && position.1.abs() <= half_size
+}
+
+fn distance_to_intersection_edge(position: (f32, f32), half_size: f32) -> f32 {
+    position.0.abs().max(position.1.abs()) - half_size
 }
