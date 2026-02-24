@@ -1,21 +1,191 @@
 // Simulation state: lanes, vehicles, and per-frame updates.
+// Uses a two-layer reservation system for intersection management.
+
 pub mod lane;
 pub mod vehicle;
 
 use lane::Lane;
 use vehicle::{Approach, Route, Vehicle};
-use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use crate::stats::Stats;
 
 pub use vehicle::{LANE_W, LANE_OFFSETS};
 
+const INTERSECTION_HALF: f32 = 4.0 * LANE_W;
+
+/// How many grid cells per axis cover the intersection.
+const GRID_N: i32 = 8;
+
+/// Width of one spatial tile in pixels.
+const TILE_SIZE: f32 = (2.0 * INTERSECTION_HALF) / GRID_N as f32;
+
+/// Duration of one time-step in seconds.
+const TIME_STEP: f32 = 0.05;
+
+/// How many time-steps we look ahead when building a reservation.
+const LOOKAHEAD: usize = 40;
+
+const VEHICLE_RADIUS: f32 = 0.55 * LANE_W;
+
+
+type VehicleId = u64;
+
+type Tile = (i32, i32);
+
+type Slot = (Tile, usize);
+
+
+#[derive(Clone)]
+pub struct Reservation {
+    pub vehicle_id: VehicleId,
+    pub entry_time: f32,
+    pub exit_time:  f32,
+}
+
+
+struct ReservationManager {
+    reservations: Vec<Reservation>,
+    reserved: HashMap<Slot, VehicleId>,
+    confirmed: HashSet<VehicleId>,
+    clock: f32,
+    next_id: VehicleId,
+}
+
+impl ReservationManager {
+    fn new() -> Self {
+        Self {
+            reservations: Vec::new(),
+            reserved:     HashMap::new(),
+            confirmed:    HashSet::new(),
+            clock:        0.0,
+            next_id:      1,
+        }
+    }
+
+
+    fn tick(&mut self, dt: f32) {
+        self.clock += dt;
+        let current_step = self.current_step();
+        // Expire old tile-slots.
+        self.reserved.retain(|&(_, t), _| t >= current_step);
+        // Expire time-interval reservations that have fully exited.
+        self.reservations.retain(|r| r.exit_time > self.clock);
+    }
+
+    fn current_step(&self) -> usize {
+        (self.clock / TIME_STEP) as usize
+    }
+
+    fn alloc_id(&mut self) -> VehicleId {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn can_reserve(&self, entry: f32, exit: f32) -> bool {
+        for r in &self.reservations {
+            let overlap = entry < r.exit_time && exit > r.entry_time;
+            if overlap {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn reserve_interval(&mut self, vehicle_id: VehicleId, entry: f32, exit: f32) {
+        self.reservations.push(Reservation { vehicle_id, entry_time: entry, exit_time: exit });
+        self.confirmed.insert(vehicle_id);
+    }
+
+
+    fn request(&mut self, id: VehicleId, slots: &[Slot]) -> bool {
+        for slot in slots {
+            if let Some(&owner) = self.reserved.get(slot) {
+                if owner != id {
+                    return false; // conflict – deny
+                }
+            }
+        }
+        for &slot in slots {
+            self.reserved.insert(slot, id);
+        }
+        self.confirmed.insert(id);
+        true
+    }
+
+    fn release(&mut self, id: VehicleId) {
+        self.reserved.retain(|_, owner| *owner != id);
+        self.reservations.retain(|r| r.vehicle_id != id);
+        self.confirmed.remove(&id);
+    }
+
+    fn has_confirmed(&self, id: VehicleId) -> bool {
+        self.confirmed.contains(&id)
+    }
+}
+
+
+
+fn tiles_at(pos: (f32, f32)) -> Vec<Tile> {
+    let mut result = Vec::new();
+    let r = VEHICLE_RADIUS + TILE_SIZE * 0.5;
+    let col_lo = ((pos.0 - r + INTERSECTION_HALF) / TILE_SIZE).floor() as i32;
+    let col_hi = ((pos.0 + r + INTERSECTION_HALF) / TILE_SIZE).floor() as i32;
+    let row_lo = ((pos.1 - r + INTERSECTION_HALF) / TILE_SIZE).floor() as i32;
+    let row_hi = ((pos.1 + r + INTERSECTION_HALF) / TILE_SIZE).floor() as i32;
+    for c in col_lo..=col_hi {
+        for rr in row_lo..=row_hi {
+            if c >= 0 && c < GRID_N && rr >= 0 && rr < GRID_N {
+                let tx = (c as f32 + 0.5) * TILE_SIZE - INTERSECTION_HALF;
+                let ty = (rr as f32 + 0.5) * TILE_SIZE - INTERSECTION_HALF;
+                let dx = tx - pos.0;
+                let dy = ty - pos.1;
+                if dx * dx + dy * dy <= r * r {
+                    result.push((c, rr));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn build_reservation_slots(
+    start_pos:  (f32, f32),
+    heading:    (f32, f32),
+    speed:      f32,
+    start_step: usize,
+) -> Vec<Slot> {
+    let mut slots = Vec::new();
+    let mut pos = start_pos;
+    for i in 0..LOOKAHEAD {
+        pos = (
+            pos.0 + heading.0 * speed * TIME_STEP,
+            pos.1 + heading.1 * speed * TIME_STEP,
+        );
+        for tile in tiles_at(pos) {
+            slots.push((tile, start_step + i));
+        }
+        if pos.0.abs() > INTERSECTION_HALF + VEHICLE_RADIUS
+            && pos.1.abs() > INTERSECTION_HALF + VEHICLE_RADIUS
+        {
+            break;
+        }
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+
 pub struct Simulation {
-    pub lanes:     Vec<Lane>,
-    pub stats:     Stats,
+    pub lanes:      Vec<Lane>,
+    pub stats:      Stats,
     pending_spawns: Vec<Approach>,
-    rng_state:     u32,
-    approach_bag:  Vec<Approach>,
-    bag_index:     usize,
+    rng_state:      u32,
+    approach_bag:   Vec<Approach>,
+    bag_index:      usize,
+    reservation:    ReservationManager,
+    vehicle_ids:    HashMap<(usize, usize, usize), VehicleId>,
 }
 
 impl Simulation {
@@ -31,11 +201,13 @@ impl Simulation {
                 Lane::new(Approach::East),
                 Lane::new(Approach::West),
             ],
-            stats: Stats::new(),
+            stats:          Stats::new(),
             pending_spawns: Vec::new(),
-            rng_state: seed as u32,
-            approach_bag: Vec::new(),
-            bag_index: 0,
+            rng_state:      seed as u32,
+            approach_bag:   Vec::new(),
+            bag_index:      0,
+            reservation:    ReservationManager::new(),
+            vehicle_ids:    HashMap::new(),
         };
         sim.refill_approach_bag();
         sim
@@ -51,44 +223,35 @@ impl Simulation {
     }
 
     pub fn update(&mut self, dt: f32) {
+        self.reservation.tick(dt);
+
         let mut spawns = Vec::new();
         std::mem::swap(&mut spawns, &mut self.pending_spawns);
         for approach in spawns {
             self.spawn_vehicle(approach);
         }
 
-        const DESPAWN_LIMIT:       f32 = 540.0;
-        const SAFE_GAP:            f32 = 1.4 * LANE_W;
-        const INTERSECTION_HALF:   f32 = 4.0 * LANE_W; // covers staggered turn triggers
-        const MIN_GAP:             f32 = SAFE_GAP;
-        const MAX_BRAKE:           f32 = 300.0;
-        const CRUISE_SPEED:        f32 = 120.0;
-        const MAX_ACCEL:           f32 = 200.0;
-        const MIN_CRAWL:           f32 = 0.0;
-        const COLLIDE_DIST:        f32 = 0.9 * LANE_W;
-        const STOP_LINE_DIST:      f32 = 0.65 * LANE_W;
-        const STOP_HOLD_TIME:      f32 = 0.35;
-
-        let intersection_occupied = self
-            .lanes
-            .iter()
-            .flat_map(|lane| lane.incoming.iter().flat_map(|v| v.iter()))
-            .any(|v| is_in_intersection(v.position, INTERSECTION_HALF));
-
-        let mut intersection_reserved = false;
+        const DESPAWN_LIMIT:  f32 = 540.0;
+        const SAFE_GAP:       f32 = 1.4 * LANE_W;
+        const MIN_GAP:        f32 = SAFE_GAP;
+        const MAX_BRAKE:      f32 = 300.0;
+        const CRUISE_SPEED:   f32 = 120.0;
+        const MAX_ACCEL:      f32 = 200.0;
+        const COLLIDE_DIST:   f32 = 0.9 * LANE_W;
+        const STOP_LINE_DIST: f32 = 0.65 * LANE_W;
+        const STOP_HOLD_TIME: f32 = 0.35;
 
         #[derive(Clone)]
         struct Planned {
             lane_idx:    usize,
             sublane_idx: usize,
             vehicle_idx: usize,
-            approach:    Approach,
             position:    (f32, f32),
             heading:     (f32, f32),
             velocity:    f32,
             next:        (f32, f32),
-            allow_enter: bool,
             progress:    f32,
+            vehicle_id:  VehicleId,
         }
 
         let mut planned: Vec<Planned> = Vec::new();
@@ -100,61 +263,66 @@ impl Simulation {
                         vehicle.position.0 + vehicle.heading.0 * vehicle.velocity * dt,
                         vehicle.position.1 + vehicle.heading.1 * vehicle.velocity * dt,
                     );
+                    let key = (lane_idx, sublane_idx, vehicle_idx);
+                    let vehicle_id = *self.vehicle_ids.entry(key)
+                        .or_insert_with(|| self.reservation.alloc_id());
                     planned.push(Planned {
                         lane_idx, sublane_idx, vehicle_idx,
-                        approach: vehicle.approach,
                         position: vehicle.position,
                         heading:  vehicle.heading,
                         velocity: vehicle.velocity,
                         next,
-                        allow_enter: false,
                         progress,
+                        vehicle_id,
                     });
                 }
             }
         }
 
-        if !intersection_occupied {
-            let enter_idxs: Vec<usize> = planned
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    !is_in_intersection(p.position, INTERSECTION_HALF)
-                        && is_in_intersection(p.next, INTERSECTION_HALF)
-                })
-                .map(|(i, _)| i)
-                .collect();
+        let current_step = self.reservation.current_step();
+        let current_time = self.reservation.clock;
 
-            if !enter_idxs.is_empty() {
-                let priority = |a: Approach| match a {
-                    Approach::North => 3,
-                    Approach::East  => 2,
-                    Approach::South => 1,
-                    Approach::West  => 0,
-                };
-                let mut winner = enter_idxs[0];
-                for &i in &enter_idxs[1..] {
-                    let pw = &planned[winner];
-                    let pi = &planned[i];
-                    if pi.progress > pw.progress
-                        || (pi.progress == pw.progress && priority(pi.approach) > priority(pw.approach))
-                    {
-                        winner = i;
-                    }
-                }
-                for &i in &enter_idxs {
-                    if i == winner { continue; }
-                    if planned[i].velocity > 0.0 {
-                        planned[i].velocity = 0.0;
-                        planned[i].next = planned[i].position;
+        for p in planned.iter_mut() {
+            let in_intersection = is_in_intersection(p.position, INTERSECTION_HALF);
+            let about_to_enter  = !in_intersection
+                && is_in_intersection(p.next, INTERSECTION_HALF);
+
+            if about_to_enter && !self.reservation.has_confirmed(p.vehicle_id) {
+        
+                let (entry_time, exit_time) =
+                    compute_reservation(p.position, p.heading, p.velocity, current_time);
+
+                if !self.reservation.can_reserve(entry_time, exit_time) {
+                    p.velocity = 0.0;
+                    p.next     = p.position;
+                 
+                } else {
+                    //  space-time
+                    let slots = build_reservation_slots(
+                        p.position,
+                        p.heading,
+                        CRUISE_SPEED,
+                        current_step,
+                    );
+                    let granted = self.reservation.request(p.vehicle_id, &slots);
+                    if granted {
+                        // Persist the time-interval alongside the tile slots.
+                        self.reservation.reserve_interval(
+                            p.vehicle_id,
+                            entry_time,
+                            exit_time,
+                        );
+                    } else {
+                        // Tile conflict
+                        p.velocity = 0.0;
+                        p.next     = p.position;
                         self.stats.record_close_call();
                     }
                 }
-                planned[winner].allow_enter = true;
-                intersection_reserved = true;
             }
         }
 
+        //  Same-lane car-following
         for lane_idx in 0..self.lanes.len() {
             for sublane_idx in 0..3usize {
                 let mut idxs: Vec<usize> = planned
@@ -165,18 +333,18 @@ impl Simulation {
                     .collect();
                 idxs.sort_by(|&a, &b| {
                     planned[b].progress.partial_cmp(&planned[a].progress)
-                        .unwrap_or(Ordering::Equal)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 for w in 1..idxs.len() {
-                    let cur_i    = idxs[w];
-                    let ahead_i  = idxs[w - 1];
+                    let cur_i   = idxs[w];
+                    let ahead_i = idxs[w - 1];
 
-                    let ahead_vel = planned[ahead_i].velocity;
+                    let ahead_vel      = planned[ahead_i].velocity;
                     let ahead_progress = planned[ahead_i].progress;
                     let cur_progress   = planned[cur_i].progress;
                     let cur_vel        = planned[cur_i].velocity;
 
-                    let gap = ahead_progress - cur_progress - MIN_GAP;
+                    let gap           = ahead_progress - cur_progress - MIN_GAP;
                     let predicted_gap = gap + (ahead_vel - cur_vel) * dt;
 
                     if predicted_gap < 0.0 {
@@ -261,25 +429,9 @@ impl Simulation {
                     if let Some(vehicle) = vec.get_mut(p.vehicle_idx) {
                         vehicle.velocity = p.velocity;
 
-                        let will_enter = !is_in_intersection(vehicle.position, INTERSECTION_HALF)
-                            && is_in_intersection(p.next, INTERSECTION_HALF);
-
-                        if will_enter {
-                            if intersection_occupied {
-                                vehicle.velocity = 0.0;
-                                self.stats.record_close_call();
-                            } else if intersection_reserved {
-                                if !p.allow_enter {
-                                    vehicle.velocity = MIN_CRAWL;
-                                    self.stats.record_close_call();
-                                }
-                            } else {
-                                intersection_reserved = true;
-                            }
-                        }
-
                         if !vehicle.stopped_once && !is_in_intersection(vehicle.position, INTERSECTION_HALF) {
-                            let stop_dist = distance_to_intersection_edge(vehicle.position, INTERSECTION_HALF);
+                            let stop_dist =
+                                distance_to_intersection_edge(vehicle.position, INTERSECTION_HALF);
                             if stop_dist <= STOP_LINE_DIST {
                                 if vehicle.stop_hold < STOP_HOLD_TIME {
                                     vehicle.stop_hold += dt;
@@ -296,20 +448,36 @@ impl Simulation {
             }
         }
 
-        // ── Despawn + per-frame velocity tracking ────────────────────────────
-        for lane in &mut self.lanes {
-            for sublane in 0..lane.incoming.len() {
-                let mut remaining = Vec::with_capacity(lane.incoming[sublane].len());
-                for vehicle in lane.incoming[sublane].drain(..) {
+        let mut ids_to_release: Vec<VehicleId> = Vec::new();
+
+        for (lane_idx, lane) in self.lanes.iter_mut().enumerate() {
+            for sublane_idx in 0..lane.incoming.len() {
+                let mut remaining = Vec::with_capacity(lane.incoming[sublane_idx].len());
+                let mut new_idx = 0usize;
+                for (old_idx, vehicle) in lane.incoming[sublane_idx].drain(..).enumerate() {
                     self.stats.record_velocity(vehicle.velocity);
                     if vehicle.is_within_bounds(DESPAWN_LIMIT) {
+                        let old_key = (lane_idx, sublane_idx, old_idx);
+                        let new_key = (lane_idx, sublane_idx, new_idx);
+                        if let Some(id) = self.vehicle_ids.remove(&old_key) {
+                            self.vehicle_ids.insert(new_key, id);
+                        }
                         remaining.push(vehicle);
+                        new_idx += 1;
                     } else {
                         self.stats.record_exit(vehicle.elapsed);
+                        let key = (lane_idx, sublane_idx, old_idx);
+                        if let Some(id) = self.vehicle_ids.remove(&key) {
+                            ids_to_release.push(id);
+                        }
                     }
                 }
-                lane.incoming[sublane] = remaining;
+                lane.incoming[sublane_idx] = remaining;
             }
+        }
+
+        for id in ids_to_release {
+            self.reservation.release(id);
         }
     }
 
@@ -321,20 +489,19 @@ impl Simulation {
             Route::Left     => 2,
         };
 
-       
         let heading = vehicle::heading_for_approach(approach);
- 
-        // Calculate perpendicular offset to the driver's right
-        let right = (-heading.1, heading.0);
+        let right   = (-heading.1, heading.0);
         let lateral_offset = LANE_OFFSETS[sublane];
         let lateral = (right.0 * lateral_offset, right.1 * lateral_offset);
 
         const SPAWN_DIST: f32 = 450.0;
-        let base = (-heading.0 * SPAWN_DIST + lateral.0, -heading.1 * SPAWN_DIST + lateral.1);
+        let base = (
+            -heading.0 * SPAWN_DIST + lateral.0,
+            -heading.1 * SPAWN_DIST + lateral.1,
+        );
 
-        // Enforce spawn spacing
         const SPAWN_GAP: f32 = 2.0 * LANE_W;
-        let dummy = Vehicle::new(approach, route, base, 0.0);
+        let dummy     = Vehicle::new(approach, route, base, 0.0);
         let spawn_prog = forward_progress(&dummy);
         if let Some(lane) = self.lanes.iter().find(|l| l.approach == approach) {
             let too_close = lane.incoming[sublane]
@@ -390,6 +557,7 @@ impl Simulation {
     }
 }
 
+
 fn forward_progress(vehicle: &Vehicle) -> f32 {
     match vehicle.approach {
         Approach::North =>  vehicle.position.1,
@@ -405,4 +573,25 @@ fn is_in_intersection(position: (f32, f32), half_size: f32) -> bool {
 
 fn distance_to_intersection_edge(position: (f32, f32), half_size: f32) -> f32 {
     position.0.abs().max(position.1.abs()) - half_size
+}
+
+/// Compute the expected [entry_time, exit_time] window for a vehicle.
+///
+/// `entry_time` = now + (distance to intersection edge) / speed
+/// `exit_time`  = entry_time + (intersection diameter) / speed
+///
+/// Uses a minimum speed of 0.1 px/s to guard against division by zero
+/// when the vehicle is temporarily stopped at the stop-line.
+fn compute_reservation(
+    position:     (f32, f32),
+    heading:      (f32, f32),
+    velocity:     f32,
+    current_time: f32,
+) -> (f32, f32) {
+    let _ = heading; // heading not needed – distance is scalar
+    let dist  = distance_to_intersection_edge(position, INTERSECTION_HALF).max(0.0);
+    let speed = velocity.max(0.1);
+    let entry_time = current_time + dist / speed;
+    let exit_time  = entry_time + (3.0 * INTERSECTION_HALF) / speed;
+    (entry_time, exit_time)
 }
