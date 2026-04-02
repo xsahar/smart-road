@@ -79,7 +79,7 @@ pub fn run() -> Result<(), String> {
             car_texture.as_ref(),
         )?;
         canvas.present();
-        std::thread::sleep(Duration::from_millis(16));
+        std::thread::sleep(Duration::from_millis(8));
     }
 
     let summary = sim.stats().summary_line();

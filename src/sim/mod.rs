@@ -232,14 +232,14 @@ impl Simulation {
         }
 
         const DESPAWN_LIMIT:  f32 = 540.0;
-        const SAFE_GAP:       f32 = 1.4 * LANE_W;
+        const SAFE_GAP:       f32 = 2.2 * LANE_W;
         const MIN_GAP:        f32 = SAFE_GAP;
-        const MAX_BRAKE:      f32 = 300.0;
-        const CRUISE_SPEED:   f32 = 120.0;
-        const MAX_ACCEL:      f32 = 200.0;
+        const MAX_BRAKE:      f32 = 500.0;
+        const CRUISE_SPEED:   f32 = 150.0;
+        const MAX_ACCEL:      f32 = 300.0;
         const COLLIDE_DIST:   f32 = 0.9 * LANE_W;
         const STOP_LINE_DIST: f32 = 0.65 * LANE_W;
-        const STOP_HOLD_TIME: f32 = 0.35;
+        const STOP_HOLD_TIME: f32 = 0.15;
 
         #[derive(Clone)]
         struct Planned {
@@ -252,6 +252,7 @@ impl Simulation {
             next:        (f32, f32),
             progress:    f32,
             vehicle_id:  VehicleId,
+            turned_sublane: Option<usize>,
         }
 
         let mut planned: Vec<Planned> = Vec::new();
@@ -274,6 +275,7 @@ impl Simulation {
                         next,
                         progress,
                         vehicle_id,
+                        turned_sublane: vehicle.turned_sublane,
                     });
                 }
             }
@@ -369,31 +371,51 @@ impl Simulation {
             }
         }
 
-        for _iter in 0..4 {
-            let mut changed = false;
-            for i in 0..planned.len() {
-                for j in (i + 1)..planned.len() {
-                    let dx = planned[i].next.0 - planned[j].next.0;
-                    let dy = planned[i].next.1 - planned[j].next.1;
-                    if dx * dx + dy * dy < COLLIDE_DIST * COLLIDE_DIST {
-                        let yield_i = planned[i].progress < planned[j].progress;
-                        let yi = if yield_i { i } else { j };
-                        let cur_vel = planned[yi].velocity;
-                        let decel   = MAX_BRAKE * dt;
-                        let new_vel = (cur_vel - decel).max(0.0);
-                        if new_vel < cur_vel {
-                            planned[yi].velocity = new_vel;
-                            planned[yi].next = (
-                                planned[yi].position.0 + planned[yi].heading.0 * new_vel * dt,
-                                planned[yi].position.1 + planned[yi].heading.1 * new_vel * dt,
-                            );
-                            changed = true;
-                            self.stats.record_close_call();
-                        }
+        // Simple collision avoidance between different lanes
+        for i in 0..planned.len() {
+            for j in (i + 1)..planned.len() {
+                // Use turned_sublane if available, otherwise original sublane
+                let i_sublane = planned[i].turned_sublane.unwrap_or(planned[i].sublane_idx);
+                let j_sublane = planned[j].turned_sublane.unwrap_or(planned[j].sublane_idx);
+                
+                // Skip same-lane pairs
+                if planned[i].lane_idx == planned[j].lane_idx && i_sublane == j_sublane {
+                    continue;
+                }
+                
+                // Quick distance pre-check
+                let dx_cur = planned[i].position.0 - planned[j].position.0;
+                let dy_cur = planned[i].position.1 - planned[j].position.1;
+                if dx_cur * dx_cur + dy_cur * dy_cur > (3.0 * LANE_W) * (3.0 * LANE_W) {
+                    continue;
+                }
+                
+                // Check next position distance
+                let dx = planned[i].next.0 - planned[j].next.0;
+                let dy = planned[i].next.1 - planned[j].next.1;
+                let dist_sq = dx * dx + dy * dy;
+                
+                if dist_sq < COLLIDE_DIST * COLLIDE_DIST {
+                    // The vehicle further back yields
+                    let yield_i = planned[i].progress < planned[j].progress;
+                    let yi = if yield_i { i } else { j };
+                    
+                    // Full stop if very close
+                    if dist_sq < (COLLIDE_DIST * 0.5) * (COLLIDE_DIST * 0.5) {
+                        planned[yi].velocity = 0.0;
+                        planned[yi].next = planned[yi].position;
+                        self.stats.record_close_call();
+                    } else if planned[yi].velocity > 0.0 {
+                        let decel = MAX_BRAKE * dt;
+                        planned[yi].velocity = (planned[yi].velocity - decel).max(0.0);
+                        planned[yi].next = (
+                            planned[yi].position.0 + planned[yi].heading.0 * planned[yi].velocity * dt,
+                            planned[yi].position.1 + planned[yi].heading.1 * planned[yi].velocity * dt,
+                        );
+                        self.stats.record_close_call();
                     }
                 }
             }
-            if !changed { break; }
         }
 
         for idx in 0..planned.len() {
